@@ -1,0 +1,314 @@
+# ==================== نصب کتابخانه‌ها ====================
+!pip install streamlit pandas numpy matplotlib scikit-learn tensorflow openpyxl -q
+
+# ==================== ایجاد فایل app.py ====================
+code = '''
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import SimpleRNN, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import io
+import warnings
+warnings.filterwarnings('ignore')
+
+st.set_page_config(
+    page_title="RNN Time Series Predictor",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.title("📈 RNN-Based Displacement Prediction Web App")
+st.markdown("""
+This application uses a **Simple Recurrent Neural Network (RNN)** to predict displacement time series data.
+You just need to upload an Excel file containing a **'Date'** column and a **'L5H291R'** column.
+""")
+
+st.sidebar.header("⚙️ Model Parameters")
+sequence_length = st.sidebar.slider("Sequence Length (Window Size)", min_value=2, max_value=20, value=4, step=1)
+train_ratio = st.sidebar.slider("Train Ratio (%)", min_value=50, max_value=90, value=80, step=5) / 100
+val_ratio = st.sidebar.slider("Validation Ratio (%)", min_value=5, max_value=30, value=10, step=5) / 100
+epochs = st.sidebar.number_input("Number of Epochs", min_value=10, max_value=500, value=200, step=10)
+batch_size = st.sidebar.selectbox("Batch Size", [4, 8, 16, 32], index=1)
+
+st.sidebar.markdown("---")
+st.sidebar.info("📌 Upload Excel file and adjust parameters")
+
+def create_sequences(data, window):
+    X, y = [], []
+    for i in range(len(data) - window):
+        X.append(data[i:i+window])
+        y.append(data[i+window])
+    return np.array(X), np.array(y)
+
+def evaluate(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    return r2, mae, mse, rmse
+
+uploaded_file = st.file_uploader("📂 Upload your Excel file", type=['xlsx', 'xls'])
+
+if uploaded_file is not None:
+    try:
+        df = pd.read_excel(uploaded_file, parse_dates=['Date'])
+        
+        if 'Date' not in df.columns or 'L5H291R' not in df.columns:
+            st.error("❌ The file must contain 'Date' and 'L5H291R' columns!")
+            st.stop()
+        
+        st.subheader("📊 Data Preview")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**First 5 rows:**")
+            st.dataframe(df.head())
+        with col2:
+            st.write(f"**Data Shape:** {df.shape[0]} rows, {df.shape[1]} columns")
+            st.write(f"**Date Range:** {df['Date'].min()} to {df['Date'].max()}")
+        
+        with st.spinner("🔄 Processing data and training model... Please wait"):
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.sort_values("Date").reset_index(drop=True)
+            series = df[['L5H291R']].values
+            
+            train_size = int(len(series) * train_ratio)
+            val_size = int(len(series) * val_ratio)
+            test_size = len(series) - train_size - val_size
+            
+            if test_size < sequence_length:
+                test_size = sequence_length
+                train_size = len(series) - val_size - test_size
+            
+            train = series[:train_size]
+            val = series[train_size:train_size+val_size]
+            test = series[train_size+val_size:]
+            
+            scaler = MinMaxScaler((0, 1))
+            train_scaled = scaler.fit_transform(train)
+            val_scaled = scaler.transform(val)
+            test_scaled = scaler.transform(test)
+            
+            X_train, y_train = create_sequences(train_scaled, sequence_length)
+            val_input = np.vstack([train_scaled[-sequence_length:], val_scaled])
+            X_val, y_val = create_sequences(val_input, sequence_length)
+            test_input = np.vstack([val_scaled[-sequence_length:], test_scaled])
+            X_test, y_test = create_sequences(test_input, sequence_length)
+            
+            model = Sequential()
+            model.add(SimpleRNN(90, input_shape=(sequence_length, 1), return_sequences=True))
+            model.add(Dropout(0.25))
+            model.add(SimpleRNN(32, return_sequences=False))
+            model.add(Dense(64, activation="relu"))
+            model.add(Dense(32, activation="relu"))
+            model.add(Dense(1))
+            
+            optimizer = Adam(learning_rate=0.001)
+            model.compile(optimizer=optimizer, loss="mse", metrics=["mae"])
+            
+            early_stop = EarlyStopping(monitor="val_loss", patience=30, restore_best_weights=True)
+            reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=8, verbose=0)
+            
+            history = model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=epochs,
+                batch_size=batch_size,
+                callbacks=[early_stop, reduce_lr],
+                verbose=0
+            )
+            
+            train_pred = scaler.inverse_transform(model.predict(X_train, verbose=0))
+            val_pred = scaler.inverse_transform(model.predict(X_val, verbose=0))
+            test_pred = scaler.inverse_transform(model.predict(X_test, verbose=0))
+            
+            y_train_real = scaler.inverse_transform(y_train)
+            y_val_real = scaler.inverse_transform(y_val)
+            y_test_real = scaler.inverse_transform(y_test)
+            
+            train_metrics = evaluate(y_train_real, train_pred)
+            val_metrics = evaluate(y_val_real, val_pred)
+            test_metrics = evaluate(y_test_real, test_pred)
+            
+            st.subheader("📊 Model Performance Metrics")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Train R²", f"{train_metrics[0]:.4f}")
+                st.metric("Train RMSE", f"{train_metrics[3]:.4f} mm")
+            with col2:
+                st.metric("Validation R²", f"{val_metrics[0]:.4f}")
+                st.metric("Validation RMSE", f"{val_metrics[3]:.4f} mm")
+            with col3:
+                st.metric("Test R²", f"{test_metrics[0]:.4f}")
+                st.metric("Test RMSE", f"{test_metrics[3]:.4f} mm")
+            
+            st.subheader("📈 Prediction Results")
+            
+            dates = df["Date"].values
+            train_start = sequence_length
+            train_end = train_start + len(y_train_real)
+            val_start = train_size
+            val_end = val_start + len(y_val_real)
+            test_start = train_size + val_size
+            test_end = test_start + len(y_test_real)
+            
+            date_train = dates[train_start:train_end]
+            date_val = dates[val_start:val_end]
+            date_test = dates[test_start:test_end]
+            
+            fig1, ax = plt.subplots(figsize=(14, 5))
+            ax.plot(date_train, y_train_real, label='Actual (Train)', color='#0072B2', linewidth=1.6)
+            ax.plot(date_train, train_pred, label='Predicted (Train)', color='#E69F00', linewidth=1.4, linestyle='--')
+            ax.plot(date_val, y_val_real, label='Actual (Val)', color='#009E73', linewidth=1.6)
+            ax.plot(date_val, val_pred, label='Predicted (Val)', color='#CC79A7', linewidth=1.4, linestyle='--')
+            ax.plot(date_test, y_test_real, label='Actual (Test)', color='#D55E00', linewidth=1.6)
+            ax.plot(date_test, test_pred, label='Predicted (Test)', color='#56B4E9', linewidth=1.4, linestyle='--')
+            
+            ax.axvline(x=dates[train_size], color='gray', linestyle=':', linewidth=1.3, alpha=0.85)
+            ax.axvline(x=dates[train_size + val_size], color='gray', linestyle=':', linewidth=1.3, alpha=0.85)
+            
+            ax.set_title('Actual vs Predicted Displacements', fontweight='bold', pad=10, fontsize=14)
+            ax.set_xlabel('Date', fontsize=12)
+            ax.set_ylabel('Displacement (mm)', fontsize=12)
+            ax.legend(loc='best', frameon=True, fancybox=False, edgecolor='black', framealpha=0.75)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.xticks(rotation=40)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig1)
+            
+            train_residuals = y_train_real.flatten() - train_pred.flatten()
+            val_residuals = y_val_real.flatten() - val_pred.flatten()
+            test_residuals = y_test_real.flatten() - test_pred.flatten()
+            
+            fig2, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+            axes[0].plot(date_train, train_residuals, color='#0072B2', linewidth=1.2)
+            axes[0].axhline(0, color='black', linestyle='--', linewidth=1)
+            axes[0].set_title('Train Residuals', fontweight='bold')
+            axes[0].set_xlabel('Date')
+            axes[0].set_ylabel('Residual (mm)')
+            axes[0].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            axes[0].tick_params(axis='x', rotation=40)
+            axes[0].grid(True, alpha=0.3)
+            
+            axes[1].plot(date_val, val_residuals, color='#009E73', linewidth=1.2)
+            axes[1].axhline(0, color='black', linestyle='--', linewidth=1)
+            axes[1].set_title('Validation Residuals', fontweight='bold')
+            axes[1].set_xlabel('Date')
+            axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            axes[1].tick_params(axis='x', rotation=40)
+            axes[1].grid(True, alpha=0.3)
+            
+            axes[2].plot(date_test, test_residuals, color='#D55E00', linewidth=1.2)
+            axes[2].axhline(0, color='black', linestyle='--', linewidth=1)
+            axes[2].set_title('Test Residuals', fontweight='bold')
+            axes[2].set_xlabel('Date')
+            axes[2].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            axes[2].tick_params(axis='x', rotation=40)
+            axes[2].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            st.pyplot(fig2)
+            
+            buf1 = io.BytesIO()
+            fig1.savefig(buf1, format='png', dpi=300, bbox_inches='tight')
+            buf1.seek(0)
+            
+            buf2 = io.BytesIO()
+            fig2.savefig(buf2, format='png', dpi=300, bbox_inches='tight')
+            buf2.seek(0)
+            
+            st.subheader("💾 Download Results")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    label="📥 Download Prediction Plot (PNG)",
+                    data=buf1,
+                    file_name="prediction_plot.png",
+                    mime="image/png"
+                )
+            with col2:
+                st.download_button(
+                    label="📥 Download Residuals Plot (PNG)",
+                    data=buf2,
+                    file_name="residuals_plot.png",
+                    mime="image/png"
+                )
+            
+            with st.expander("🔍 View Model Summary"):
+                summary_str = []
+                model.summary(print_fn=lambda x: summary_str.append(x))
+                st.text('\n'.join(summary_str))
+            
+            st.success("✅ Prediction completed successfully!")
+            
+    except Exception as e:
+        st.error(f"❌ An error occurred: {str(e)}")
+        st.info("Please make sure your Excel file has 'Date' and 'L5H291R' columns.")
+
+else:
+    st.info("👈 Please upload an Excel file to get started.")
+    with st.expander("📖 How to use this app"):
+        st.markdown("""
+        ### Instructions:
+        1. Upload Excel file with columns: `Date` and `L5H291R`
+        2. Adjust parameters in sidebar
+        3. View results and download plots
+        """)
+
+st.markdown("---")
+st.markdown("Built with Streamlit • RNN Time Series Predictor")
+'''
+
+with open('app.py', 'w') as f:
+    f.write(code)
+
+print("✅ app.py created successfully!")
+
+# ==================== اجرای Streamlit و نمایش لینک ====================
+import subprocess
+import time
+import threading
+from google.colab import output
+
+# تابع برای اجرای Streamlit
+def run_streamlit():
+    subprocess.Popen(['streamlit', 'run', 'app.py', '--server.port', '8501', '--server.address', '0.0.0.0'])
+
+# اجرا در ترد جداگانه
+thread = threading.Thread(target=run_streamlit)
+thread.start()
+
+# صبر برای راه‌اندازی
+time.sleep(8)
+
+# ==================== نمایش لینک به روش‌های مختلف ====================
+print("\n" + "="*60)
+print("✅ Streamlit app is running!")
+print("="*60)
+
+# روش 1: iframe
+try:
+    output.serve_kernel_port_as_iframe(8501)
+    print("🔗 Method 1: Click the iframe link above")
+except:
+    pass
+
+# روش 2: URL مستقیم
+print("\n🔗 Method 2: Copy and paste this URL in your browser:")
+print("   https://localhost:8501")
+
+# روش 3: استفاده از tunnel (اگه روش‌های بالا جواب نداد)
+print("\n🔗 Method 3: If the above doesn't work, run this in a new cell:")
+print("   from google.colab import output")
+print("   output.serve_kernel_port_as_iframe(8501)")
+
+print("\n" + "="*60)
